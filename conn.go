@@ -7,9 +7,12 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mediocregopher/radix/v4/internal/proc"
+	"github.com/mediocregopher/radix/v4/internal/testutil"
 	"github.com/mediocregopher/radix/v4/resp"
 	"github.com/mediocregopher/radix/v4/resp/resp3"
 )
@@ -39,6 +42,8 @@ type connMarshalerUnmarshaler struct {
 	ctx                    context.Context
 	marshal, unmarshalInto interface{}
 	errCh                  chan error
+
+	readSeq uint64 // read sequence number in conn
 }
 
 type conn struct {
@@ -53,6 +58,13 @@ type conn struct {
 	// errChPool is a buffered channel used as a makeshift pool of chan errors,
 	// so we don't have to make a new one on every EncodeDecode call.
 	errChPool chan chan error
+
+	readSeqCounter uint64
+
+	currReadSeqMu sync.Mutex
+	currReadSeq   uint64
+
+	testUnmarshalBefore testutil.SyncPoint
 }
 
 var _ Conn = new(conn)
@@ -61,41 +73,75 @@ func (c *conn) Close() error {
 	return c.proc.PrefixedClose(c.conn.Close, nil)
 }
 
+func (c *conn) read(ctx context.Context, unmarshalInto interface{}, seq uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	c.currReadSeqMu.Lock()
+	defer c.currReadSeqMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	} else if deadline, ok := ctx.Deadline(); ok {
+		if err := c.conn.SetReadDeadline(deadline); err != nil {
+			return fmt.Errorf("setting read deadline to %v: %w", deadline, err)
+		}
+	} else if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("unsetting read deadline: %w", err)
+	}
+
+	c.currReadSeq = seq
+	c.currReadSeqMu.Unlock()
+
+	c.testUnmarshalBefore.Sync()
+
+	err := resp3.Unmarshal(c.br, unmarshalInto, c.rOpts)
+
+	c.currReadSeqMu.Lock()
+
+	if err != nil {
+		// simplify things for the caller by translating network
+		// timeouts into DeadlineExceeded, since that's actually what
+		// happened.
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			err = context.DeadlineExceeded
+		}
+	}
+
+	return err
+}
+
 func (c *conn) reader(ctx context.Context) {
 	doneCh := ctx.Done()
+	var discardErr error
 	for {
 		select {
 		case <-doneCh:
 			return
 		case mu := <-c.rCh:
-
-			if err := mu.ctx.Err(); err != nil {
-				mu.errCh <- err
-				continue
-			} else if deadline, ok := mu.ctx.Deadline(); ok {
-				if err := c.conn.SetReadDeadline(deadline); err != nil {
-					mu.errCh <- fmt.Errorf("setting read deadline to %v: %w", deadline, err)
-					continue
-				}
-			} else if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
-				mu.errCh <- fmt.Errorf("unsetting read deadline: %w", err)
+			if discardErr != nil {
+				mu.errCh <- discardErr
 				continue
 			}
-
-			err := resp3.Unmarshal(c.br, mu.unmarshalInto, c.rOpts)
-			if err != nil {
-				// simplify things for the caller by translating network
-				// timeouts into DeadlineExceeded, since that's actually what
-				// happened.
-				var netErr net.Error
-				if errors.As(err, &netErr) && netErr.Timeout() {
-					err = context.DeadlineExceeded
-				}
-			}
-
+			err := c.read(mu.ctx, mu.unmarshalInto, mu.readSeq)
 			mu.errCh <- err
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				discardErr = c.discardNext()
+			}
 		}
 	}
+}
+
+func (c *conn) discardNext() error {
+	if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("unsetting read deadline: %w", err)
+	}
+	if err := resp3.Unmarshal(c.br, nil, c.rOpts); err != nil && !errors.As(err, new(resp.ErrConnUsable)) {
+		return fmt.Errorf("discarding old response: %w", err)
+	}
+	return nil
 }
 
 func (c *conn) getErrCh() chan error {
@@ -116,6 +162,7 @@ func (c *conn) putErrCh(errCh chan error) {
 
 func (c *conn) EncodeDecode(ctx context.Context, m, u interface{}) error {
 	mu := connMarshalerUnmarshaler{
+		readSeq:       atomic.AddUint64(&c.readSeqCounter, 1),
 		ctx:           ctx,
 		marshal:       m,
 		unmarshalInto: u,
@@ -134,7 +181,29 @@ func (c *conn) EncodeDecode(ctx context.Context, m, u interface{}) error {
 
 	select {
 	case <-doneCh:
-		return ctx.Err()
+		c.currReadSeqMu.Lock()
+		if c.currReadSeq != mu.readSeq {
+			// either mu was already processed, in which case we can read the
+			// result or is still in the queue in which case it will be skipped
+			c.currReadSeqMu.Unlock()
+			select {
+			case err := <-mu.errCh:
+				c.putErrCh(mu.errCh)
+				return err
+			default:
+				return ctx.Err()
+			}
+		}
+		// mu is currently being processed, cancel it
+		c.conn.SetReadDeadline(time.Unix(1, 1))
+		c.currReadSeqMu.Unlock()
+		select {
+		case <-closedCh:
+			return proc.ErrClosed
+		case err := <-mu.errCh:
+			c.putErrCh(mu.errCh)
+			return err
+		}
 	case <-closedCh:
 		return proc.ErrClosed
 	case err := <-mu.errCh:

@@ -1,6 +1,7 @@
 package radix
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -168,4 +169,40 @@ func TestConnConcurrentMarshalUnmarshal(t *T) {
 		assert.NoError(t, conn.EncodeDecode(ctx, []string{"ECHO", vv[i]}, nil))
 	}
 	wg.Wait()
+}
+
+func TestConnReadTimeoutRace(t *T) {
+	ctx := testCtx(t)
+	c := dial()
+
+	var connId uint64
+	require.NoError(t, c.EncodeDecode(ctx, []string{"CLIENT", "ID"}, &connId))
+
+	syncCh := c.(*conn).testUnmarshalBefore.Block()
+
+	popCtx, popCtxCancel := context.WithCancel(ctx)
+	popErrCh := make(chan error, 1)
+
+	go func() {
+		popErrCh <- c.EncodeDecode(popCtx, []string{"BLPOP", randStr(), "0"}, &Maybe{})
+	}()
+
+	t.Logf("waiting for reader to reach syncpoint for BLPOP read")
+	<-syncCh
+
+	t.Logf("canceling context for BLPOP")
+	popCtxCancel()
+
+	t.Logf("unblocking connection")
+	metaConn := dial()
+	require.NoError(t, metaConn.EncodeDecode(ctx, []string{"CLIENT", "UNBLOCK", fmt.Sprint(connId), "ERROR"}, nil))
+	require.NoError(t, metaConn.Close())
+
+	t.Logf("waiting for BLPOP timeout")
+	assert.Error(t, <-popErrCh, context.DeadlineExceeded)
+
+	t.Logf("checking that next command returns sucessfully")
+	var got string
+	assert.NoError(t, c.EncodeDecode(ctx, []string{"ECHO", "hello"}, &got))
+	assert.Equal(t, "hello", got)
 }
